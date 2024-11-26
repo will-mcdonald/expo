@@ -8,21 +8,11 @@ import android.database.Cursor
 import android.os.Bundle
 import android.provider.CalendarContract
 import android.util.Log
-import expo.modules.calendar.EventRecurrenceUtils.createRecurrenceRule
-import expo.modules.calendar.EventRecurrenceUtils.extractRecurrence
-import expo.modules.calendar.dialogs.CreateEventContract
-import expo.modules.calendar.dialogs.CreateEventIntentResult
-import expo.modules.calendar.dialogs.CreatedEventOptions
-import expo.modules.calendar.dialogs.ViewEventIntentResult
-import expo.modules.calendar.dialogs.ViewEventContract
-import expo.modules.calendar.dialogs.ViewedEventOptions
 import expo.modules.core.arguments.ReadableArguments
 import expo.modules.core.errors.InvalidArgumentException
 import expo.modules.interfaces.permissions.Permissions
 import expo.modules.kotlin.Promise
-import expo.modules.kotlin.activityresult.AppContextActivityResultLauncher
 import expo.modules.kotlin.exception.Exceptions
-import expo.modules.kotlin.functions.Coroutine
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import kotlinx.coroutines.CoroutineScope
@@ -38,24 +28,12 @@ class CalendarModule : Module() {
   private val contentResolver
     get() = (appContext.reactContext ?: throw Exceptions.ReactContextLost()).contentResolver
 
-  private lateinit var createEventLauncher: AppContextActivityResultLauncher<CreatedEventOptions, CreateEventIntentResult>
-  private lateinit var viewEventLauncher: AppContextActivityResultLauncher<ViewedEventOptions, ViewEventIntentResult>
-
   private val sdf = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'").apply {
     timeZone = TimeZone.getTimeZone("GMT")
   }
 
   override fun definition() = ModuleDefinition {
     Name("ExpoCalendar")
-
-    RegisterActivityContracts {
-      createEventLauncher = registerForActivityResult(
-        CreateEventContract()
-      )
-      viewEventLauncher = registerForActivityResult(
-        ViewEventContract()
-      )
-    }
 
     OnDestroy {
       try {
@@ -134,7 +112,7 @@ class CalendarModule : Module() {
       }
     }
 
-    AsyncFunction("saveEventAsync") { details: ReadableArguments, _: ReadableArguments?, promise: Promise ->
+    AsyncFunction("saveEventAsync") { details: ReadableArguments, options: ReadableArguments?, promise: Promise ->
       withPermissions(promise) {
         launchAsyncWithModuleScope(promise) {
           try {
@@ -151,7 +129,7 @@ class CalendarModule : Module() {
       }
     }
 
-    AsyncFunction("deleteEventAsync") { details: ReadableArguments, _: ReadableArguments?, promise: Promise ->
+    AsyncFunction("deleteEventAsync") { details: ReadableArguments, options: ReadableArguments?, promise: Promise ->
       withPermissions(promise) {
         launchAsyncWithModuleScope(promise) {
           try {
@@ -203,26 +181,7 @@ class CalendarModule : Module() {
       }
     }
 
-    AsyncFunction("createEventInCalendarAsync") Coroutine { eventOptions: CreatedEventOptions ->
-      val result = createEventLauncher.launch(eventOptions)
-      return@Coroutine result
-    }
-
-    AsyncFunction("openEventInCalendarAsync") Coroutine { params: ViewedEventOptions ->
-      val result = viewEventLauncher.launch(params)
-      return@Coroutine result
-    }
-
-    AsyncFunction("editEventInCalendarAsync") Coroutine { params: ViewedEventOptions ->
-      viewEventLauncher.launch(params)
-      val editResult = CreateEventIntentResult()
-      return@Coroutine editResult
-    }
-
-    /**
-     * @deprecated in favor of openEventInCalendarAsync
-     * */
-    AsyncFunction("openEventInCalendar") { eventID: String ->
+    AsyncFunction("openEventInCalendar") { eventID: Int ->
       val context = appContext.reactContext ?: throw Exceptions.ReactContextLost()
       val uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, eventID.toLong())
       val sendIntent = Intent(Intent.ACTION_VIEW).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).setData(uri)
@@ -267,6 +226,7 @@ class CalendarModule : Module() {
   }
 
   private fun findEvents(startDate: Any, endDate: Any, calendars: List<String>): List<Bundle> {
+    Log.d("CAL FIND EVENT", "USING GWE")
     val eStartDate = Calendar.getInstance()
     val eEndDate = Calendar.getInstance()
     try {
@@ -297,13 +257,12 @@ class CalendarModule : Module() {
       selection += calendarQuery
     }
     selection += ")"
-    val sortOrder = "${CalendarContract.Instances.BEGIN} ASC"
     val cursor = contentResolver.query(
       uri,
       findEventsQueryParameters,
       selection,
       null,
-      sortOrder
+      null
     )
 
     requireNotNull(cursor) { "Cursor shouldn't be null" }
@@ -481,9 +440,33 @@ class CalendarModule : Module() {
     if (details.containsKey("recurrenceRule")) {
       val recurrenceRule = details.getArguments("recurrenceRule")
       if (recurrenceRule.containsKey("frequency")) {
-        val opts = extractRecurrence(recurrenceRule)
-
-        if (opts.endDate == null && opts.occurrence == null) {
+        val frequency = recurrenceRule.getString("frequency")
+        var interval: Int? = null
+        var occurrence: Int? = null
+        var endDate: String? = null
+        if (recurrenceRule.containsKey("interval")) {
+          interval = recurrenceRule.getInt("interval")
+        }
+        if (recurrenceRule.containsKey("occurrence")) {
+          occurrence = recurrenceRule.getInt("occurrence")
+        }
+        if (recurrenceRule.containsKey("endDate")) {
+          val format = SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'")
+          val endDateObj = recurrenceRule["endDate"]
+          if (endDateObj is String) {
+            val parsedDate = sdf.parse(endDateObj)
+            if (parsedDate != null) {
+              endDate = format.format(parsedDate)
+            } else {
+              Log.e(TAG, "endDate is null")
+            }
+          } else if (endDateObj is Number) {
+            val calendar = Calendar.getInstance()
+            calendar.timeInMillis = endDateObj.toLong()
+            endDate = format.format(calendar.time)
+          }
+        }
+        if (endDate == null && occurrence == null) {
           val eventStartDate = calendarEventBuilder.getAsLong(CalendarContract.Events.DTSTART)
           val eventEndDate = calendarEventBuilder.getAsLong(CalendarContract.Events.DTEND)
           val duration = (eventEndDate - eventStartDate) / 1000
@@ -492,7 +475,7 @@ class CalendarModule : Module() {
             .putNull(CalendarContract.Events.DTEND)
             .put(CalendarContract.Events.DURATION, "PT${duration}S")
         }
-        val rule = createRecurrenceRule(opts)
+        val rule = createRecurrenceRule(frequency, interval, endDate, occurrence)
         calendarEventBuilder.put(CalendarContract.Events.RRULE, rule)
       }
     }
@@ -646,6 +629,25 @@ class CalendarModule : Module() {
     }
   }
 
+  private fun createRecurrenceRule(recurrence: String, interval: Int?, endDate: String?, occurrence: Int?): String {
+    var rrule: String = when (recurrence) {
+      "daily" -> "FREQ=DAILY"
+      "weekly" -> "FREQ=WEEKLY"
+      "monthly" -> "FREQ=MONTHLY"
+      "yearly" -> "FREQ=YEARLY"
+      else -> ""
+    }
+    if (interval != null) {
+      rrule += ";INTERVAL=$interval"
+    }
+    if (endDate != null) {
+      rrule += ";UNTIL=$endDate"
+    } else if (occurrence != null) {
+      rrule += ";COUNT=$occurrence"
+    }
+    return rrule
+  }
+
   private fun serializeEvents(cursor: Cursor): List<Bundle> {
     val results: MutableList<Bundle> = ArrayList()
     while (cursor.moveToNext()) {
@@ -673,41 +675,41 @@ class CalendarModule : Module() {
       foundEndDate.timeInMillis = endDate.toLong()
       endDateUTC = sdf.format(foundEndDate.time)
     }
-    val rrule = optStringFromCursor(cursor, CalendarContract.Events.RRULE)
-    val rruleBundle = if (rrule != null) {
-      val recurrenceRule = Bundle()
-      val recurrenceRules = rrule.split(";").toTypedArray()
-      recurrenceRule.putString("frequency", recurrenceRules[0].split("=").toTypedArray()[1].lowercase(Locale.getDefault()))
-      if (recurrenceRules.size >= 2 && recurrenceRules[1].split("=").toTypedArray()[0] == "INTERVAL") {
-        recurrenceRule.putInt("interval", recurrenceRules[1].split("=").toTypedArray()[1].toInt())
-      }
-      if (recurrenceRules.size >= 3) {
-        val terminationRules = recurrenceRules[2].split("=").toTypedArray()
-        if (terminationRules.size >= 2) {
-          if (terminationRules[0] == "UNTIL") {
-            try {
-              recurrenceRule.putString("endDate", sdf.parse(terminationRules[1])?.toString())
-            } catch (e: ParseException) {
-              Log.e(TAG, "Couldn't parse the `endDate` property.", e)
-            } catch (e: NullPointerException) {
-              Log.e(TAG, "endDate is null", e)
-            }
-          } else if (terminationRules[0] == "COUNT") {
-            recurrenceRule.putInt("occurrence", recurrenceRules[2].split("=").toTypedArray()[1].toInt())
-          }
-        }
-        Log.e(TAG, "Couldn't parse termination rules: '${recurrenceRules[2]}'.", null)
-      }
-      recurrenceRule
-    } else {
-      null
-    }
+    // val rrule = optStringFromCursor(cursor, CalendarContract.Events.RRULE)
+    // val rruleBundle = if (rrule != null) {
+    //   val recurrenceRule = Bundle()
+    //   val recurrenceRules = rrule.split(";").toTypedArray()
+    //   recurrenceRule.putString("frequency", recurrenceRules[0].split("=").toTypedArray()[1].lowercase(Locale.getDefault()))
+    //   if (recurrenceRules.size >= 2 && recurrenceRules[1].split("=").toTypedArray()[0] == "INTERVAL") {
+    //     recurrenceRule.putInt("interval", recurrenceRules[1].split("=").toTypedArray()[1].toInt())
+    //   }
+    //   if (recurrenceRules.size >= 3) {
+    //     val terminationRules = recurrenceRules[2].split("=").toTypedArray()
+    //     if (terminationRules.size >= 2) {
+    //       if (terminationRules[0] == "UNTIL") {
+    //         try {
+    //           recurrenceRule.putString("endDate", sdf.parse(terminationRules[1])?.toString())
+    //         } catch (e: ParseException) {
+    //           Log.e(TAG, "Couldn't parse the `endDate` property.", e)
+    //         } catch (e: NullPointerException) {
+    //           Log.e(TAG, "endDate is null", e)
+    //         }
+    //       } else if (terminationRules[0] == "COUNT") {
+    //         recurrenceRule.putInt("occurrence", recurrenceRules[2].split("=").toTypedArray()[1].toInt())
+    //       }
+    //     }
+    //     Log.e(TAG, "Couldn't parse termination rules: '${recurrenceRules[2]}'.", null)
+    //   }
+    //   recurrenceRule
+    // } else {
+    //   null
+    // }
 
     // may be CalendarContract.Instances.EVENT_ID or CalendarContract.Events._ID (which have different string values)
     val event = Bundle().apply {
-      rruleBundle?.let {
-        putBundle("recurrenceRule", it)
-      }
+      // rruleBundle?.let {
+      //   putBundle("recurrenceRule", it)
+      // }
       putString("id", cursor.getString(0))
       putString("calendarId", optStringFromCursor(cursor, CalendarContract.Events.CALENDAR_ID))
       putString("title", optStringFromCursor(cursor, CalendarContract.Events.TITLE))
